@@ -13,7 +13,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-API = "https://api.anilibria.tv/v3"
+API = "https://anilibria.top/api/v1"
 
 class Anime:
     @staticmethod
@@ -23,7 +23,7 @@ class Anime:
         logger.info(f"Выполняется поиск аниме по запросу: {name}")
 
         try:
-            response = requests.get(f"{API}/title/search?search={encoded_name}&filter=id,names,team,genres[0]&limit=10")
+            response = requests.get(f"{API}/app/search/releases?query={encoded_name}")
             response.raise_for_status()
             data = response.json()
             logger.info(f"Успешно получены данные для запроса: {name}")
@@ -32,9 +32,10 @@ class Anime:
             anime_list = [
                 {
                     "id": anime["id"],
-                    "name": anime["names"]["ru"]
-                } for anime in data["list"]
+                    "name": anime["name"]["main"]
+                } for anime in data
             ]
+            logger.info(f"Найденные тайлы: {anime_list}")
             logger.info(f"Найдено {len(anime_list)} результатов для запроса: {name}")
             return anime_list
         except requests.exceptions.RequestException as e:
@@ -49,32 +50,20 @@ class Anime:
         logger.info(f"Запрос информации об аниме с ID: {title_id}")
 
         try:
-            response = requests.get(f"{API}/title?id={title_id}")
+            response = requests.get(f"{API}/anime/releases/{title_id}")
             response.raise_for_status()
             data = response.json()
             logger.info(f"Успешно получены данные для аниме с ID: {title_id}")
 
             episodes = [
                 {
-                    "title_id": title_id,
-                    "title_name": data['names']['ru'],
+                    "title_id": data['id'],
+                    "title_name": data['name']['main'],
                     "description": data['description'],
-                    "poster": data['posters']['original']['url'],
-                    "genres": data['genres']
+                    "poster": data['poster']['src'],
+                    # "genres": data['genres']
                 }
             ]
-            for play in data['player']['list'].values():
-                # Приоритетное получение ссылки
-                link = (
-                    play['hls'].get('fhd') or
-                    play['hls'].get('hd') or
-                    play['hls'].get('sd')
-                )
-                episodes.append({
-                    "episode": play['episode'],
-                    "name": play['name'] if play['name'] is not None else "Нет названия",
-                    "link": link,
-                })
             logger.info(f"Успешно обработаны данные для аниме с ID: {title_id}")
             return episodes
         except requests.exceptions.RequestException as e:
@@ -84,29 +73,88 @@ class Anime:
             logger.error(f"Непредвиденная ошибка при обработке запроса информации для аниме с ID {title_id}: {e}")
             return []
         
+    @staticmethod
     async def get_torrent(title_id):
         logger.info(f"Запрос информации о торренте для аниме с ID: {title_id}")
 
         try:
-            response = requests.get(f"{API}/title?id={title_id}&filter=torrents")
+            response = requests.get(f"{API}/anime/releases/{title_id}")
+            response.raise_for_status()
+            data = response.json()
+
+            if "torrents" not in data:
+                logger.error(f"Ошибка: ключ 'torrents' не найден в ответе API")
+                return []
+
+            torrents = data["torrents"]
+            if not isinstance(torrents, list):
+                logger.error(f"Ошибка: 'torrents' должен быть списком, но получен {type(torrents)}")
+                return []
+
+            torrent_list = []
+            for torrent in torrents:
+                quality = f"{torrent['type']['description']} {torrent['quality']['value']}"
+                if 'HEVC' in torrent['codec']['value']:
+                    quality += " hevc"
+                size_gb = torrent['size'] / (1024 ** 3)
+
+                torrent_list.append({
+                    "quality": quality,
+                    "size": f"{size_gb:.2f} GB",
+                    "torrent_id": torrent["id"]
+                })
+
+            return torrent_list
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Ошибка при выполнении запроса: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"Непредвиденная ошибка: {e}")
+            return []
+
+    @staticmethod  
+    async def download_torrent(torrent_id, title_id):
+        logger.info(f"Запрос информации о торренте с ID: {torrent_id} для аниме с ID: {title_id}")
+
+        try:
+            response = requests.get(f"{API}/anime/releases/{title_id}")
             response.raise_for_status()
             data = response.json()
             logger.info(f"Успешно получены данные о торренте для аниме с ID: {title_id}")
 
-            torrents = [
-                {
-                    "quality": torrent['quality']['string'],
-                    "size": torrent['size_string'],
-                    "magnet": torrent['magnet']
-                } for torrent in data['torrents']['list']
-            ]
+            if "torrents" not in data:
+                logger.error("Ошибка: ключ 'torrents' не найден в ответе API")
+                return None
 
-            print(torrents)
+            torrents = data["torrents"]
+            if not isinstance(torrents, list):
+                logger.error(f"Ошибка: 'torrents' должен быть списком, но получен {type(torrents)}")
+                return None
 
-            return torrents
+            # Отладка: вывод всех ID торрент-файлов
+            available_ids = [torrent["id"] for torrent in torrents]
+            logger.debug(f"Список доступных ID торрентов: {available_ids}")
+            
+            # Преобразуем torrent_id в int, если он вдруг строка
+            torrent_id = int(torrent_id)
+
+            for torrent in torrents:
+                logger.debug(f"Проверка торрент-файла: {torrent['id']} == {torrent_id}")
+                if torrent["id"] == torrent_id:
+                    magnet = torrent["magnet"]
+                    magnet_hash = torrent["hash"]
+                    logger.info(f"Найден торрент {torrent_id}, магнет-ссылка: {magnet}")
+                    return magnet, magnet_hash
+
+            logger.error(f"Торрент с ID {torrent_id} не найден для аниме с ID {title_id}")
+            return None
         except requests.exceptions.RequestException as e:
-            logger.error(f"Ошибка при выполнении запроса информации о торренте для аниме с ID {title_id}: {e}")
-            return []
+            logger.error(f"Ошибка при выполнении запроса: {e}")
+            return None
+        except ValueError as e:
+            logger.error(f"Ошибка преобразования ID: {e}")
+            return None
         except Exception as e:
-            logger.error(f"Непредвиденная ошибка при обработке запроса информации о торренте для аниме с ID {title_id}: {e}")
-            return []
+            logger.error(f"Непредвиденная ошибка: {e}")
+            return None

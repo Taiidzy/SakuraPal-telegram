@@ -1,10 +1,28 @@
+import os
+import subprocess
+import platform
+import time
 import logging
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+import qbittorrentapi
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaDocument
 from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 from service.api import Anime
+# from service.downloader import Downloader
+
+QB_HOST = "localhost"
+QB_PORT = 8080
+QB_USERNAME = "admin"
+QB_PASSWORD = "adminadmin"
+
+qb = qbittorrentapi.Client(
+    host=QB_HOST,
+    port=QB_PORT,
+    username=QB_USERNAME,
+    password=QB_PASSWORD
+)
 
 # Настройка логирования
 logging.basicConfig(
@@ -14,10 +32,18 @@ logging.basicConfig(
         logging.StreamHandler()  # Логирование в консоль
     ]
 )
+logging.getLogger('httpx').setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Хранилище для состояния пользователя
 user_states = {}
+
+try:
+    qb.auth_log_in()
+    logger.info("Подключено к qBittorrent")
+except qbittorrentapi.LoginFailed:
+    exit()
+    logger.error(f"Ошибка авторизации: {qbittorrentapi.LoginFailed}")
 
 # Функция обработки команды /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -67,7 +93,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         image_url = f"https://static-libria.weekstorm.one{title[0]['poster']}"
-        text = f"Название:\n<b>{title[0]['title_name']}</b>\nОписание:\n{title[0]['description']}\nЖанры: {title[0]['genres']}"
+        text = f"Название:\n<b>{title[0]['title_name']}</b>\nОписание:\n{title[0]['description']}"
         keyboard = [
             [InlineKeyboardButton("Назад", callback_data="go_back_search")],
             [InlineKeyboardButton("Скачать", callback_data=f"download_{title[0]['title_id']}")],
@@ -99,14 +125,96 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         keyboard = [
-            [InlineKeyboardButton(f"{torrent['quality']} Размер: {torrent['size']}", callback_data=f"animeDownload")]
+            [InlineKeyboardButton(f"{torrent['quality']} Размер: {torrent['size']}", callback_data=f"animeDownload_{torrent['torrent_id']}_{anime_id}")]
             for torrent in torrents_list
         ]
-        keyboard.append([InlineKeyboardButton("Назад", callback_data="go_back_search")])
+        keyboard.append([InlineKeyboardButton("Назад", callback_data=f"animeID_{anime_id}")])
         reply_markup = InlineKeyboardMarkup(keyboard)
-        logger.info(keyboard)
         await query.message.delete()
         await query.message.reply_text("Выберите качество:", reply_markup=reply_markup)
+
+    elif query.data.startswith("animeDownload_"):
+        torrent_id = query.data.split("_")[1]
+        anime_id = query.data.split("_")[2]
+        logger.info(f"Пользователь {query.from_user.id} запросил скачивание аниме с ID: {anime_id}")
+        magnet, magnet_hash = await Anime.download_torrent(torrent_id, anime_id)
+
+        query = update.callback_query
+        await query.answer()
+        
+        qb.torrents_add(urls=magnet)
+        logger.info(f"Начата загрузка для магнит-ссылки: {magnet}")
+        time.sleep(5)
+        
+        torrents_info = qb.torrents_info(hash=magnet_hash)
+        torrent = next((t for t in torrents_info if t.hash == magnet_hash), None)
+        
+        if not torrent:
+            logger.error(f"Не удалось найти торрент по ссылке: {magnet}")
+            await update.reply_text("Не удалось найти торрент.")
+            return
+
+        while torrent.state != "seeding":
+            torrents = qb.torrents_info()
+            torrent = next((t for t in torrents if t.hash == magnet_hash), None)
+            progress = torrent.progress * 100
+            logger.info(f"Прогресс загрузки: {progress}%")
+            if progress >= 100:
+                logger.info("Загрузка завершена, отправка медиа...")
+                await query.edit_message_text("Загрузка завершена, отправка медиа...")
+                break
+            await query.edit_message_text(f"Загрузка: {progress:.2f}%")
+            time.sleep(5)
+
+        files = qb.torrents_files(torrent.hash)
+        sorted_files = sorted(files, key=lambda f: f.name)
+
+        for file in sorted_files:
+            file_path = os.path.join(torrent.save_path, file.name)
+            compressed_path = file_path.replace(".mp4", "_compressed.mp4")
+
+            logger.info(f"Сжимаем видео: {file.name}")
+            compressed_video = compress_video(file_path, compressed_path)
+            
+            if compressed_video:
+                logger.info(f"Отправка сжатого файла: {compressed_video}")
+                with open(compressed_video, "rb") as f:
+                    media = InputMediaDocument(f)
+                    await query.message.reply_document(media, caption=f"Сжатая версия {file.name}")
+            else:
+                logger.warning(f"Не удалось сжать файл: {file.name}, отправляется оригинал.")
+                with open(file_path, "rb") as f:
+                    media = InputMediaDocument(f)
+                    await query.message.reply_document(media, caption=f"Оригинал {file.name}")
+        
+        qb.torrents_remove(hashes=[torrent.hash])
+        logger.info(f"Торрент {torrent.hash} удален после отправки файлов.")
+
+def compress_video(input_path, output_path):
+    max_size = 50 * 1024 * 1024  # 50MB
+    
+    # Определяем команду для FFmpeg в зависимости от ОС
+    if platform.system() == "Windows":
+        ffmpeg_cmd = [
+            "ffmpeg.exe", "-i", input_path,
+            "-c:v", "libx264", "-b:v", "500k", "-c:a", "aac", "-b:a", "128k", 
+            "-preset", "fast", output_path
+        ]
+    else:
+        # Linux версия (закомментирована)
+        # ffmpeg_cmd = [
+        #     "ffmpeg", "-i", input_path,
+        #     "-c:v", "libx264", "-b:v", "500k", "-c:a", "aac", "-b:a", "128k", 
+        #     "-preset", "fast", output_path
+        # ]
+        pass
+    
+    subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    
+    if os.path.getsize(output_path) > max_size:
+        print("Файл все еще больше 50MB, попробуйте уменьшить битрейт.")
+        return None
+    return output_path
 
 # Обработка текстового ввода
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -144,7 +252,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == '__main__':
     logger.info("Запуск бота...")
     # Замени 'YOUR_TOKEN' на токен от BotFather
-    app = ApplicationBuilder().token("7648087080:AAGWbigCK_I9aR4mfdfCw4IqDMweshM2vww").build()
+    app = ApplicationBuilder().token("7648087080:AAGWbigCK_I9aR4mfdfCw4IqDMweshM2vww").connect_timeout(120).build()
 
     # Регистрируем обработчики
     app.add_handler(CommandHandler("start", start))
